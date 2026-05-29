@@ -165,10 +165,16 @@ def _vec(lm) -> List[float]:
     # for the derivation; this single composed line is the only
     # bridge between the two coordinate systems and the only
     # place to change if a different orientation is needed.
+    #
+    # The z sign is empirically chosen: with +mp.x, forehand and
+    # backhand swept in the same screen-x direction (visible in
+    # rakija). Flipping to -mp.x mirrors them, so a right-handed
+    # forehand sweeps opposite the right-handed backhand as
+    # anatomically expected.
     return [
         -float(lm.z),
         -float(lm.y) + _PELVIS_LIFT_Y,
-        +float(lm.x),
+        -float(lm.x),
     ]
 
 
