@@ -53,31 +53,53 @@ def make_landmarker(model_path: Path):
         lm.close()
 
 
-def detect_video(video_path: Path, model_path: Path,
-                 ) -> Iterator[tuple[float, RigJoints]]:
-    """Yield (timestamp_seconds, RigJoints) for every frame where
-    MediaPipe successfully landmarked the player.
+def detect_with_landmarker(
+    video_path: Path,
+    landmarker,
+    *,
+    session_offset_ms: int = 0,
+) -> Iterator[tuple[float, RigJoints]]:
+    """Yield (t_local_seconds, RigJoints) for every detected frame.
 
-    Timestamps come from CAP_PROP_POS_MSEC so they reflect the
-    actual frame timing in the source video (THETIS recordings are
-    17 fps but we don't hardcode that — different sources will
-    have different rates).
+    The landmarker is supplied by the caller — batch ingest creates
+    one and reuses it across the whole run, saving the ~300 ms
+    EGL + model-load overhead the per-video path would otherwise
+    repeat 1980 times.
+
+    MediaPipe's VIDEO running-mode contract requires monotonically
+    increasing timestamps. Each video's own CAP_PROP_POS_MSEC
+    resets to 0, so we add `session_offset_ms` per frame to keep
+    the sequence monotone across videos. The yielded `t` stays
+    per-video so the resulting trajectories still start at 0
+    (rakija expects local-to-the-swing times).
     """
-    with open_video(video_path) as cap, make_landmarker(model_path) as lm:
+    with open_video(video_path) as cap:
         while True:
             ok, frame_bgr = cap.read()
             if not ok:
                 break
-            t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            t_local_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             # OpenCV → MediaPipe wants RGB.
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(
                 image_format=mp.ImageFormat.SRGB, data=frame_rgb,
             )
-            result = lm.detect_for_video(mp_image, int(t_ms))
+            result = landmarker.detect_for_video(
+                mp_image, int(session_offset_ms + t_local_ms),
+            )
             if not result.pose_world_landmarks:
                 continue
             joints = mediapipe_to_joints(result.pose_world_landmarks[0])
             if joints is None:
                 continue
-            yield t_ms / 1000.0, joints
+            yield t_local_ms / 1000.0, joints
+
+
+def detect_video(video_path: Path, model_path: Path,
+                 ) -> Iterator[tuple[float, RigJoints]]:
+    """Single-video convenience: build a fresh landmarker, run, tear
+    down. Used by the `convert` subcommand. The `ingest` batch path
+    uses `detect_with_landmarker` directly with a shared instance.
+    """
+    with make_landmarker(model_path) as lm:
+        yield from detect_with_landmarker(video_path, lm)

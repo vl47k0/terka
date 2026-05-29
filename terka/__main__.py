@@ -19,7 +19,7 @@ import click
 
 from terka.client import VertexClient
 from terka.meta import iter_dataset, parse_video
-from terka.pose import detect_video
+from terka.pose import detect_video, detect_with_landmarker, make_landmarker
 from terka.trajectory import to_json_text, trajectory_doc
 
 
@@ -101,46 +101,76 @@ def convert(video: Path, model_path: Path, pretty: bool, out: Path | None):
                    "(e.g. 'forehand_flat,backhand'). Empty = all.")
 def ingest(rgb_root: Path, model_path: Path, vertex_url: str,
            limit: int | None, actions_filter: str):
-    """Walk a THETIS VIDEO_RGB tree; convert + POST each video."""
+    """Walk a THETIS VIDEO_RGB tree; convert + POST each video.
+
+    Builds ONE MediaPipe Pose Landmarker for the whole run and
+    threads it through every video — avoids the ~300 ms EGL +
+    model-load overhead the single-video path would otherwise
+    repeat 1980 times. Cumulative `session_offset_ms` keeps the
+    per-frame timestamps monotonic across videos, which is what
+    MediaPipe's VIDEO running-mode contract requires.
+    """
     actions = {a for a in actions_filter.split(",") if a}
     client = VertexClient(vertex_url)
     n_ok = n_skip = n_fail = 0
-    for i, meta in enumerate(iter_dataset(rgb_root)):
-        if actions and meta.action not in actions:
-            continue
-        if limit is not None and (n_ok + n_fail) >= limit:
-            break
-        click.echo(f"[{i:04d}] {meta.path.name} → {meta.device_id}", err=True)
-        try:
-            samples = list(detect_video(meta.path, model_path))
-        except Exception as exc:
-            click.echo(f"  detect failed: {exc}", err=True)
-            n_fail += 1
-            continue
-        if len(samples) < 2:
-            click.echo(f"  skip — only {len(samples)} usable frames", err=True)
-            n_skip += 1
-            continue
-        doc = trajectory_doc(samples, extra={
-            "thetis": {
-                "subject_num": meta.subject_num,
-                "action": meta.action,
-                "sequence": meta.sequence,
-                "expertise": meta.expertise,
-            }
-        })
-        try:
-            resp = client.upload(doc, device_id=meta.device_id)
-        except Exception as exc:
-            click.echo(f"  upload failed: {exc}", err=True)
-            n_fail += 1
-            continue
-        click.echo(
-            f"  uploaded id={resp.get('id')} "
-            f"frames={len(samples)} duration={doc['duration_s']:.2f}s",
-            err=True,
-        )
-        n_ok += 1
+    # Bumped after each video by that video's duration + a small
+    # safety gap so consecutive videos' timestamps don't overlap.
+    session_offset_ms = 0
+    with make_landmarker(model_path) as lm:
+        for i, meta in enumerate(iter_dataset(rgb_root)):
+            if actions and meta.action not in actions:
+                continue
+            if limit is not None and (n_ok + n_fail) >= limit:
+                break
+            click.echo(
+                f"[{i:04d}] {meta.path.name} → {meta.device_id}",
+                err=True,
+            )
+            try:
+                samples = list(detect_with_landmarker(
+                    meta.path, lm,
+                    session_offset_ms=session_offset_ms,
+                ))
+            except Exception as exc:
+                click.echo(f"  detect failed: {exc}", err=True)
+                n_fail += 1
+                # Push the offset along anyway by a conservative 10 s
+                # so a partially-consumed video doesn't poison the
+                # next call's timestamp expectation.
+                session_offset_ms += 10_000
+                continue
+            # Even on a 0-1 frame video, bump the offset by enough
+            # to keep timestamps strictly increasing for the next
+            # detect_for_video call.
+            video_span_ms = int(samples[-1][0] * 1000) if samples else 0
+            session_offset_ms += video_span_ms + 100
+            if len(samples) < 2:
+                click.echo(
+                    f"  skip — only {len(samples)} usable frames",
+                    err=True,
+                )
+                n_skip += 1
+                continue
+            doc = trajectory_doc(samples, extra={
+                "thetis": {
+                    "subject_num": meta.subject_num,
+                    "action": meta.action,
+                    "sequence": meta.sequence,
+                    "expertise": meta.expertise,
+                }
+            })
+            try:
+                resp = client.upload(doc, device_id=meta.device_id)
+            except Exception as exc:
+                click.echo(f"  upload failed: {exc}", err=True)
+                n_fail += 1
+                continue
+            click.echo(
+                f"  uploaded id={resp.get('id')} "
+                f"frames={len(samples)} duration={doc['duration_s']:.2f}s",
+                err=True,
+            )
+            n_ok += 1
     click.echo(
         f"\ndone — ok={n_ok} skip={n_skip} fail={n_fail}", err=True,
     )
