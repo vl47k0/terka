@@ -309,7 +309,11 @@ def build_classifier(rgb_root: Path, model_path: Path):
 
     # Honest cross-validated accuracy on the just-built corpus.
     # Auto-shrink n_splits so a sparse smoke-test corpus doesn't crash.
-    smallest_class = int(np.bincount(corpus.y).min())
+    # Use Counter, not np.bincount — bincount returns counts indexed
+    # from 0, but our labels start at 1 so index-0 is always empty,
+    # which would falsely report "smallest class has 0 samples".
+    from collections import Counter
+    smallest_class = min(Counter(corpus.y.tolist()).values())
     n_splits = min(5, smallest_class)
     if n_splits < 2:
         click.echo(
