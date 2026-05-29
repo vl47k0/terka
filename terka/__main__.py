@@ -11,6 +11,7 @@ Subcommands:
 
 from __future__ import annotations
 
+import json
 import sys
 import urllib.request
 from pathlib import Path
@@ -19,6 +20,13 @@ import click
 
 from contextlib import ExitStack
 
+from terka.classify import (
+    TennisShotClassifier,
+    build_self_trained_corpus,
+    classify_trajectory_json,
+    clear_cached_classifier,
+    load_self_trained_corpus,
+)
 from terka.client import VertexClient
 from terka.joints import (
     apply_racket_tip,
@@ -258,6 +266,84 @@ def ingest(rgb_root: Path, model_path: Path | None,
     click.echo(
         f"\ndone — ok={n_ok} skip={n_skip} fail={n_fail}", err=True,
     )
+
+
+@cli.command("build-classifier")
+@click.argument("rgb_root", type=click.Path(exists=True, path_type=Path))
+@click.option("--model", "model_path", type=click.Path(exists=True, path_type=Path),
+              required=True, help="Path to pose_landmarker_*.task")
+def build_classifier(rgb_root: Path, model_path: Path):
+    """Walk a THETIS RGB tree, build a self-trained classifier corpus.
+
+    For every clip: detect with MediaPipe, smooth + trim to the swing
+    window, compute the 225-dim Activity Feature Vector, label by
+    THETIS action directory. Write the corpus to
+    `~/.cache/terka/corpus.npz` (~40 min on LITE) and a fitted
+    classifier to `~/.cache/terka/classifier.pkl`. Future `terka
+    classify` calls use this self-consistent classifier in preference
+    to Varia's published .mat files.
+
+    Reports the 5-fold cross-validated accuracy on the built corpus
+    at the end so you can decide whether the model is worth shipping.
+    """
+    import numpy as np
+    from sklearn.model_selection import cross_val_score, StratifiedKFold
+
+    corpus = build_self_trained_corpus(
+        rgb_root, model_path, progress=lambda m: click.echo(m, err=True),
+    )
+    click.echo(
+        f"\ncorpus stats: {corpus.X.shape[0]} swings × {corpus.X.shape[1]} "
+        f"features, {len(np.unique(corpus.y))} classes",
+        err=True,
+    )
+    # Fit + persist
+    clear_cached_classifier()
+    cls = TennisShotClassifier().fit(corpus)
+    cache_dir = Path.home() / ".cache" / "terka"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    import pickle
+    with open(cache_dir / "classifier.pkl", "wb") as f:
+        pickle.dump(cls, f)
+    click.echo(f"wrote classifier → {cache_dir / 'classifier.pkl'}", err=True)
+
+    # Honest cross-validated accuracy on the just-built corpus.
+    # Auto-shrink n_splits so a sparse smoke-test corpus doesn't crash.
+    smallest_class = int(np.bincount(corpus.y).min())
+    n_splits = min(5, smallest_class)
+    if n_splits < 2:
+        click.echo(
+            f"smallest class has {smallest_class} sample(s) — "
+            "skipping cross-validation",
+            err=True,
+        )
+    else:
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
+        fresh = TennisShotClassifier()
+        scores = cross_val_score(fresh.pipeline, corpus.X, corpus.y, cv=cv)
+        click.echo(
+            f"{n_splits}-fold CV accuracy: "
+            f"{scores.mean()*100:.1f}% ± {scores.std()*100:.1f}%",
+            err=True,
+        )
+
+
+@cli.command()
+@click.argument("trajectory", type=click.Path(exists=True, path_type=Path))
+@click.option("--pretty/--no-pretty", default=True)
+def classify(trajectory: Path, pretty: bool):
+    """Classify a rakija-format trajectory JSON by shot class.
+
+    Uses Varia 2018's Activity-Feature-Vector pipeline (torso-
+    normalised joint distances → k-means representative postures →
+    multi-class SVM) trained on the 681 labelled swings shipped
+    in `ref/thetis-dataset-improvement/.../input_results/*.mat`.
+    Outputs the predicted action + decision-function score per
+    class.
+    """
+    result = classify_trajectory_json(trajectory)
+    indent = 2 if pretty else None
+    click.echo(json.dumps(result, indent=indent))
 
 
 if __name__ == "__main__":
