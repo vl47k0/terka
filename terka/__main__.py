@@ -18,6 +18,11 @@ from pathlib import Path
 import click
 
 from terka.client import VertexClient
+from terka.joints import (
+    apply_racket_tip,
+    smooth_samples,
+    trim_to_swing_window,
+)
 from terka.meta import iter_dataset, parse_video
 from terka.pose import detect_video, detect_with_landmarker, make_landmarker
 from terka.trajectory import to_json_text, trajectory_doc
@@ -61,9 +66,12 @@ def download_model(variant: str, dest: Path):
 @click.option("--model", "model_path", type=click.Path(exists=True, path_type=Path),
               required=True, help="Path to pose_landmarker_*.task")
 @click.option("--pretty/--no-pretty", default=False)
+@click.option("--raw/--cleaned", default=False,
+              help="--raw skips smoothing + swing-window trim; default --cleaned.")
 @click.option("-o", "--out", type=click.Path(path_type=Path),
               help="Write to file instead of stdout.")
-def convert(video: Path, model_path: Path, pretty: bool, out: Path | None):
+def convert(video: Path, model_path: Path, pretty: bool, raw: bool,
+            out: Path | None):
     """Convert one video to a rakija-schema trajectory JSON."""
     meta = parse_video(video)
     extra = None
@@ -79,6 +87,10 @@ def convert(video: Path, model_path: Path, pretty: bool, out: Path | None):
     samples = list(detect_video(video, model_path))
     if not samples:
         click.echo(f"WARN no frames detected in {video}", err=True)
+    if not raw and len(samples) >= 2:
+        samples = smooth_samples(samples)
+        samples, _ = trim_to_swing_window(samples)
+        apply_racket_tip(samples)
     doc = trajectory_doc(samples, extra=extra)
     text = to_json_text(doc, pretty=pretty)
     if out:
@@ -151,6 +163,12 @@ def ingest(rgb_root: Path, model_path: Path, vertex_url: str,
                 )
                 n_skip += 1
                 continue
+            # Cleanup pass: kill MP LITE jitter + trim to the swing
+            # window so the trail reads as a swing instead of 4 s of
+            # static-frame noise. See joints.py module docstring.
+            samples = smooth_samples(samples)
+            samples, _ = trim_to_swing_window(samples)
+            apply_racket_tip(samples)
             doc = trajectory_doc(samples, extra={
                 "thetis": {
                     "subject_num": meta.subject_num,

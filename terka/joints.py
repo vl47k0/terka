@@ -61,6 +61,31 @@ Future kadar capture with an ArUco marker on the racket throat
 replaces this guess with measured tip pose; the data contract
 stays identical.
 
+Smoothing + swing-window trim
+-----------------------------
+MediaPipe LITE on 640×480 Kinect video is noisy — even when the
+subject is standing still, joints wobble ~3 cm/frame (median
+trail-segment jump, measured on p32 forehand). Across a 4.7 s
+THETIS clip with only ~0.5 s of actual swing, that noise
+dominates the visualisation and the trail reads as a scribble
+instead of a swing.
+
+`smooth_samples` runs a 3-frame box average over all joint
+positions (boundary frames use one-sided windows). 3 frames
+≈ 175 ms — small enough to preserve the crisp velocity peak
+at contact, large enough to wipe out the static-frame jitter.
+
+`trim_to_swing_window` finds the peak wrist velocity frame
+(after smoothing — noise spikes shouldn't pick the peak) and
+keeps `[i_peak − 6, i_peak + 10]` ≈ 0.35 s prep + 0.6 s
+follow-through. Sets `duration_s` from the trimmed window so
+playback runs in real time.
+
+Both ops are post-processing on the assembled per-frame
+RigJoints list, not inside `mediapipe_to_joints`, so the
+mapping stays single-responsibility (MP → rakija axes) and
+the cleanup is testable in isolation.
+
 What this does NOT fix
 - Subject orientation in the THETIS recording is camera-relative,
   not court-relative. If a clip isn't square-to-camera (some
@@ -203,11 +228,121 @@ def mediapipe_to_joints(world_landmarks) -> RigJoints | None:
         r_shoulder  = r_sh,
         r_elbow     = r_el,
         r_wrist     = r_wr,
-        # No racket marker on THETIS — extrapolate the tip along
-        # the forearm direction so the trail reads as a real
-        # racket head sweeping through the swing instead of a
-        # short wrist trail. See module docstring.
-        r_racket_tip = _racket_tip_from(r_wr, r_el),
+        # Placeholder — the racket-tip extrapolation happens AFTER
+        # smoothing so the tip is computed from the smoothed
+        # forearm direction (otherwise the smoothed wrist+elbow
+        # would disagree with the un-smoothed tip).
+        r_racket_tip = [r_wr[0], r_wr[1], r_wr[2]],
         l_elbow      = _vec(world_landmarks[LEFT_ELBOW]),
         l_hand       = _vec(world_landmarks[LEFT_WRIST]),
     )
+
+
+# --------------------------------------------------------------------- #
+# Post-processing: jitter smoothing + swing-window trim                  #
+# --------------------------------------------------------------------- #
+#
+# Operates on the assembled per-frame (t, RigJoints) list produced by
+# detect_video / detect_with_landmarker. Keeping these out of
+# mediapipe_to_joints means the MP→rakija mapping stays single-
+# responsibility, and the cleanup is unit-testable in isolation.
+
+
+_JOINT_FIELDS = (
+    "pelvis", "spine_top", "head_center",
+    "l_hip", "r_hip", "l_knee", "r_knee", "l_ankle", "r_ankle",
+    "l_toe", "r_toe", "l_shoulder", "r_shoulder",
+    "r_elbow", "r_wrist", "r_racket_tip",
+    "l_elbow", "l_hand",
+)
+
+
+def smooth_samples(samples, window: int = 3):
+    """3-frame box average on every joint position (boundaries one-sided).
+
+    Wipes the ~3 cm/frame jitter MediaPipe LITE adds to static joints
+    without blunting the swing's velocity peak (3 frames ≈ 175 ms at
+    17 fps, much shorter than a swing's ~500 ms duration). `window`
+    must be odd; default 3 is what bulk-import needs. Returns a new
+    list — input is not mutated.
+    """
+    if window < 1 or window % 2 == 0:
+        raise ValueError(f"window must be odd and ≥ 1, got {window}")
+    if len(samples) < 2:
+        return list(samples)
+
+    half = window // 2
+    n = len(samples)
+    out = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        k = hi - lo
+        new_joints = {}
+        for field in _JOINT_FIELDS:
+            sx = sy = sz = 0.0
+            for j in range(lo, hi):
+                v = getattr(samples[j][1], field)
+                sx += v[0]; sy += v[1]; sz += v[2]
+            new_joints[field] = [sx / k, sy / k, sz / k]
+        out.append((samples[i][0], RigJoints(**new_joints)))
+    return out
+
+
+def apply_racket_tip(samples):
+    """Recompute r_racket_tip from each frame's (smoothed) elbow + wrist.
+
+    Run AFTER smooth_samples so the tip uses the smoothed forearm
+    direction. Mutates the existing RigJoints in place — cheap, and
+    sample lists are owned by the per-video pipeline.
+    """
+    for _, j in samples:
+        j.r_racket_tip = _racket_tip_from(j.r_wrist, j.r_elbow)
+    return samples
+
+
+def trim_to_swing_window(samples, prep_frames: int = 6,
+                         follow_frames: int = 10):
+    """Trim the trajectory to a window around the peak wrist velocity.
+
+    THETIS clips are ~4.7 s but only ~0.5 s is the actual swing —
+    the rest is the subject standing still with MediaPipe wobbling
+    their joints. Keeping the full clip floods the trail with
+    static-frame noise. Default window: 6 frames prep + 10 frames
+    follow-through ≈ 0.35 s + 0.6 s at 17 fps.
+
+    The trimmed sample timestamps are RE-BASED to start at t=0 so
+    rakija's scrub slider covers the swing window, not the original
+    setup-padded range. Returns (new_samples, new_duration_s).
+    """
+    if len(samples) < 3:
+        # Too short to find a peak meaningfully — return as-is.
+        if not samples:
+            return samples, 0.0
+        return list(samples), samples[-1][0] - samples[0][0]
+
+    n = len(samples)
+    peak_i = 0
+    peak_v2 = -1.0
+    # Central-difference wrist velocity; skip endpoints.
+    for i in range(1, n - 1):
+        t_prev, j_prev = samples[i - 1]
+        t_next, j_next = samples[i + 1]
+        dt = t_next - t_prev
+        if dt <= 0:
+            continue
+        dx = (j_next.r_wrist[0] - j_prev.r_wrist[0]) / dt
+        dy = (j_next.r_wrist[1] - j_prev.r_wrist[1]) / dt
+        dz = (j_next.r_wrist[2] - j_prev.r_wrist[2]) / dt
+        v2 = dx * dx + dy * dy + dz * dz
+        if v2 > peak_v2:
+            peak_v2 = v2
+            peak_i = i
+
+    lo = max(0, peak_i - prep_frames)
+    hi = min(n, peak_i + follow_frames + 1)
+    window = list(samples[lo:hi])
+    t0 = window[0][0]
+    rebased = [(t - t0, j) for (t, j) in window]
+    duration = rebased[-1][0] - rebased[0][0]
+    return rebased, duration
