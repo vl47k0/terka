@@ -125,3 +125,4 @@ Mapping by directory:
 | `smash` | `smash` |
 
 Subjects p1 to p31 are beginners; p32 to p55 are experts.
+# terka
