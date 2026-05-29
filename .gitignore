@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Model files — download once via `terka download-model`.
+*.task
+
+# CLI scratch
+/out/
+*.json.gz
