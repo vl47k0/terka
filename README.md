@@ -82,19 +82,62 @@ reads `samples` + `duration_s`) but it stays available in vertex
 for any downstream analysis that wants subject + action without
 re-parsing the device_id string.
 
-## What's deliberately NOT in the converter
+## Axis bridge — MediaPipe → rakija
 
-- **T-pose calibration.** kadar derives a rakija-world transform
-  from a single calibration frame; here the recordings don't
-  include one. We dump MediaPipe's hip-centered axes as-is, so
-  rakija renders the figure in some camera-relative orientation.
-  The motion shape + the trail is still useful for comparison.
-  Future work: pick the first "still" frame per video, derive a
-  per-video calibration.
-- **Racket-tip tracking.** No ArUco marker in the THETIS recordings,
-  so `r_racket_tip` stubs to the right wrist (same as kadar's
-  pre-marker MVP).
-- **Swing-window trim.** Videos are ~4.7 s of full setup → swing →
+Single per-joint transform in `terka/joints.py:_vec`:
+
+```python
+rakija_x = -mp.z                # MP "into scene"  → rakija forward
+rakija_y = -mp.y + 1.10         # MP "down"        → rakija up
+                                #                    + lift pelvis to canvas anchor
+rakija_z = +mp.x                # MP "image right" → rakija anatomical-left
+```
+
+After this, the THETIS subject lands facing rakija's +x with the
+pelvis at rakija's canonical y=1.10. r_hip drops to -z (subject's
+right side), l_hip to +z, head_center forward of pelvis on +x.
+A forehand contact reaches into +x with the racket above shoulder
+height (~y=2.0 m).
+
+The combined transform is composed of a y-axis flip (MP image-down
+to rakija up), a y-axis lift, and a +90° rotation about +y. All
+proper — handedness is preserved, so `pose_from_joints` back-solves
+cleanly when "Drive Skeleton from Trail" is on in rakija.
+
+## Racket-tip extrapolation
+
+THETIS has no racket marker, so the dataset alone can't tell us
+where the racket head is — only where the wrist is. Stubbing
+`r_racket_tip = r_wrist` paints a wrist trail that looks too small
+to read as a swing (a forehand "tip" should arc through chest +
+overhead, not just chest).
+
+`_racket_tip_from(wrist, elbow)` in `joints.py` extrapolates the
+tip along the forearm direction:
+
+```
+tip = wrist + 0.55 m × normalise(wrist − elbow)
+```
+
+The 55 cm constant is wrist-to-racket-head along the forearm,
+based on a standard adult racket geometry. Accurate when the
+wrist is locked (forearm + racket roughly collinear); under-rotated
+when the wrist breaks (slice / kick serve) — but the swing SHAPE
+comes through correctly for the bulk-import flow.
+
+Future kadar capture with an ArUco marker on the racket throat
+replaces this guess with a measured pose; the on-disk schema is
+unchanged.
+
+## What's still deliberately NOT in the converter
+
+- **Per-clip T-pose calibration.** Our +90° rotation assumes the
+  subject is square to the camera. Most THETIS clips are; some
+  serves stand sideways and end up rotated weird. Per-clip
+  calibration (detect a quiet "ready" frame, derive a basis from
+  hips + shoulders) would land each video in a consistent court
+  frame — out of scope for the bulk import.
+- **Swing-window trim.** Videos are ~4.7 s of setup → swing →
   follow-through. We write the entire video as one trajectory;
   rakija's scrub bar covers the whole thing. Future work: detect
   the contact frame (wrist-velocity peak, same as kadar's
