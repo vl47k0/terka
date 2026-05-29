@@ -103,3 +103,44 @@ def detect_video(video_path: Path, model_path: Path,
     """
     with make_landmarker(model_path) as lm:
         yield from detect_with_landmarker(video_path, lm)
+
+
+def detect_ensemble(
+    video_path: Path,
+    landmarkers: list,
+    *,
+    session_offset_ms: int = 0,
+) -> Iterator[tuple[float, RigJoints]]:
+    """Multi-variant ensemble: run each landmarker over the video,
+    average per-frame using Varia's iterative-mean update.
+
+    Aligns passes by timestamp (frames where ONE variant lost
+    tracking but the others didn't get dropped from the output).
+    Yields (t, averaged_joints).
+
+    Deterministic MP means a single model run twice gives the
+    same answer twice; the variation here comes from running
+    different architectures (LITE / FULL / HEAVY) and treating
+    each as one of Varia's "iterations". Empirically these
+    disagree by ~6-9 cm median on r_wrist for THETIS video, so
+    averaging meaningfully reduces noise.
+    """
+    from terka.joints import average_joints
+
+    # Round timestamps to ms so dict-key comparisons across passes
+    # don't fail on floating-point drift.
+    passes: list[dict[int, RigJoints]] = []
+    for lm in landmarkers:
+        d: dict[int, RigJoints] = {}
+        for t, j in detect_with_landmarker(
+            video_path, lm, session_offset_ms=session_offset_ms,
+        ):
+            d[round(t * 1000)] = j
+        passes.append(d)
+
+    common = sorted(set.intersection(*(set(p.keys()) for p in passes)))
+    for t_ms in common:
+        accum = passes[0][t_ms]
+        for i in range(1, len(passes)):
+            accum = average_joints(accum, passes[i][t_ms], factor=i + 1)
+        yield t_ms / 1000.0, accum

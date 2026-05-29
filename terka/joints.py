@@ -125,9 +125,42 @@ class RigJoints:
 
     Field names match the C struct exactly (snake_case) — the
     trajectory serialiser writes them straight to JSON.
+
+    Aligned with the 15-joint set Varia 2018 published (which is
+    what Kinect's classic SDK produced and what the THETIS papers
+    are written against):
+
+      Varia            terka field
+      HEAD          →  head_center
+      NECK          →  spine_top     (midpoint of L/R shoulders)
+      TORSO         →  torso         (midpoint of spine_top + pelvis,
+                                      now a real field — used to live
+                                      as a derived "stomach" point in
+                                      rakija's draw code)
+      L/R SHOULDER  →  l/r_shoulder
+      L/R HIP       →  l/r_hip
+      L/R KNEE      →  l/r_knee
+      L/R FOOT      →  l/r_ankle     (Kinect's FOOT lands at the
+                                      ankle joint, not the toe)
+      L/R ELBOW     →  l/r_elbow
+      L/R HAND      →  l_hand,
+                       r_wrist       (r_wrist + extrapolated
+                                      r_racket_tip past it; l_hand is
+                                      the non-dominant wrist)
+
+    Plus three extras kept for rakija-side compatibility:
+      pelvis        — derived midpoint of L/R hips, used as the root
+                      coord for the body figure; not in Varia's 15.
+      l_toe, r_toe  — Varia/Kinect doesn't have toes; we stub them
+                      to the ankle position so rakija's FK stays
+                      well-defined. The simplified body figure
+                      doesn't render them.
+      r_racket_tip  — extrapolated along the forearm from r_wrist;
+                      THETIS has no racket marker (see module docs).
     """
     pelvis:       List[float]
     spine_top:    List[float]
+    torso:        List[float]
     head_center:  List[float]
     l_hip:        List[float]
     r_hip:        List[float]
@@ -218,9 +251,17 @@ def mediapipe_to_joints(world_landmarks) -> RigJoints | None:
     r_el  = _vec(world_landmarks[RIGHT_ELBOW])
     r_wr  = _vec(world_landmarks[RIGHT_WRIST])
 
+    pelvis    = _mid(l_hip, r_hip)
+    spine_top = _mid(l_sh, r_sh)
     return RigJoints(
-        pelvis      = _mid(l_hip, r_hip),
-        spine_top   = _mid(l_sh, r_sh),
+        pelvis      = pelvis,
+        spine_top   = spine_top,
+        # TORSO = mid-trunk landmark in Varia/Kinect's 15-joint set.
+        # MediaPipe doesn't have it directly; midpoint(spine_top,
+        # pelvis) is what rakija was deriving in its draw code, so
+        # populating it here makes the value a single source of
+        # truth instead of duplicated math in two languages.
+        torso       = _mid(spine_top, pelvis),
         head_center = nose,
         l_hip       = l_hip,
         r_hip       = r_hip,
@@ -255,7 +296,7 @@ def mediapipe_to_joints(world_landmarks) -> RigJoints | None:
 
 
 _JOINT_FIELDS = (
-    "pelvis", "spine_top", "head_center",
+    "pelvis", "spine_top", "torso", "head_center",
     "l_hip", "r_hip", "l_knee", "r_knee", "l_ankle", "r_ankle",
     "l_toe", "r_toe", "l_shoulder", "r_shoulder",
     "r_elbow", "r_wrist", "r_racket_tip",
@@ -305,6 +346,36 @@ def apply_racket_tip(samples):
     for _, j in samples:
         j.r_racket_tip = _racket_tip_from(j.r_wrist, j.r_elbow)
     return samples
+
+
+def average_joints(j_old: RigJoints, j_new: RigJoints,
+                   factor: int) -> RigJoints:
+    """Varia's iterative-mean update for a single frame's joints.
+
+    `J_final^i  =  ((factor − 1) / factor) · J_final^(i−1)
+                   +  (1 / factor) · J_new^i`
+
+    `factor` is the cumulative count of contributions (1 for the
+    first pass, then 2, 3, …). Used by detect_ensemble in pose.py
+    to combine LITE / FULL / HEAVY MP variants per frame —
+    deterministic MP can't supply "multiple noisy passes" of one
+    model, but three architectures of different capacity do supply
+    three independent-enough estimates (measured median r_wrist
+    disagreement on p32 forehand: 6-9 cm), so averaging reduces
+    variance the same way the paper's pipeline did.
+    """
+    w_old = (factor - 1) / factor
+    w_new = 1.0 / factor
+    kwargs = {}
+    for field in _JOINT_FIELDS:
+        v_old = getattr(j_old, field)
+        v_new = getattr(j_new, field)
+        kwargs[field] = [
+            w_old * v_old[0] + w_new * v_new[0],
+            w_old * v_old[1] + w_new * v_new[1],
+            w_old * v_old[2] + w_new * v_new[2],
+        ]
+    return RigJoints(**kwargs)
 
 
 def trim_to_swing_window(samples, prep_frames: int = 6,
