@@ -2,3 +2,6 @@ mediapipe~=0.10.21
 opencv-python-headless~=4.10.0
 requests~=2.32
 click~=8.1
+# Activity-Feature-Vector classifier in terka/classify.py imports both.
+scipy~=1.17
+scikit-learn~=1.8
