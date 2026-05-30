@@ -40,6 +40,7 @@ from terka.pose import (
     detect_with_landmarker,
     make_landmarker,
 )
+from terka.strike_defaults import default_for_action
 from terka.trajectory import to_json_text, trajectory_doc
 
 
@@ -134,7 +135,8 @@ def convert(video: Path, model_path: Path | None,
         samples = smooth_samples(samples)
         samples, _ = trim_to_swing_window(samples)
         apply_racket_tip(samples)
-    doc = trajectory_doc(samples, extra=extra)
+    strike_params = default_for_action(meta.action) if meta else None
+    doc = trajectory_doc(samples, extra=extra, strike_params=strike_params)
     text = to_json_text(doc, pretty=pretty)
     if out:
         out.write_text(text)
@@ -243,7 +245,10 @@ def ingest(rgb_root: Path, model_path: Path | None,
             samples = smooth_samples(samples)
             samples, _ = trim_to_swing_window(samples)
             apply_racket_tip(samples)
-            doc = trajectory_doc(samples, extra={
+            doc = trajectory_doc(
+                samples,
+                strike_params=default_for_action(meta.action),
+                extra={
                 "thetis": {
                     "subject_num": meta.subject_num,
                     "action": meta.action,
