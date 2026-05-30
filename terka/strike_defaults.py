@@ -184,3 +184,68 @@ def default_for_action(action: str) -> dict[str, Any] | None:
     can decide whether to fall back to a generic default or omit
     the strike_params block entirely."""
     return DEFAULTS_BY_ACTION.get(action)
+
+
+# Where the player's BODY (pelvis) stands in court x. Class-default
+# contact.x_m bakes in a typical forearm reach (~0.6 m), so the
+# player anchor is the class default minus that reach. Two flavours:
+# ground-stroke players are 2.65 m behind their own baseline, serve
+# players ~0.5 m inside it.
+_PLAYER_X_GROUND = COURT_X_LO - 2.65 - 0.60   # ≈ 9.86
+_PLAYER_X_SERVE  = COURT_X_LO + 0.50 - 0.60   # ≈ 13.01
+
+_SERVE_ACTIONS = {"flat_service", "kick_service", "slice_service", "smash"}
+
+
+def _player_anchor_for(action: str) -> tuple[float, float]:
+    """Court (x, z) where the player's pelvis sits for the given
+    action's typical stance. The captured trail's racket-tip is
+    expressed relative to its own pelvis (which terka's axis bridge
+    pins at (0, 1.10, 0) in trail-world), so adding the anchor to
+    the trail-tip lands the contact point in court coords."""
+    is_serve = action in _SERVE_ACTIONS
+    return (_PLAYER_X_SERVE if is_serve else _PLAYER_X_GROUND, COURT_Z_MID)
+
+
+def for_action_with_contact(action: str, samples) -> dict[str, Any] | None:
+    """Return strike_params for `action`, with `contact.x_m / y_m / z_m`
+    overridden from the captured trail's racket-tip at the peak
+    r_wrist-velocity frame. `samples` is the list[(t, RigJoints)]
+    that the pipeline has already cleaned + trimmed.
+
+    The remaining contact fields (ball_lon, ball_lat, bed_u, bed_v)
+    stay at the class-default values — terka has no racket marker
+    so the on-string contact location can't be measured from MP
+    pose alone.
+
+    If samples are too sparse or the action is unknown, falls back
+    to the class default unchanged."""
+    base = DEFAULTS_BY_ACTION.get(action)
+    if base is None:
+        return None
+    if not samples or len(samples) < 3:
+        return base
+
+    # Peak r_wrist velocity = contact frame. Central difference, edges
+    # excluded so a single noisy boundary sample can't win argmax.
+    peak_i = 1
+    peak_v2 = -1.0
+    for i in range(1, len(samples) - 1):
+        a = samples[i - 1][1].r_wrist
+        b = samples[i + 1][1].r_wrist
+        v2 = (b[0]-a[0])**2 + (b[1]-a[1])**2 + (b[2]-a[2])**2
+        if v2 > peak_v2:
+            peak_v2 = v2
+            peak_i = i
+
+    tip = samples[peak_i][1].r_racket_tip
+    anchor_x, anchor_z = _player_anchor_for(action)
+    derived_contact = {
+        "x_m": anchor_x + tip[0],
+        "y_m": max(0.0, tip[1]),       # never below ground
+        "z_m": anchor_z + tip[2],
+    }
+
+    out = dict(base)
+    out["contact"] = {**base["contact"], **derived_contact}
+    return out
